@@ -9,7 +9,8 @@ import re
 import warnings
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Annotated, Any
+from functools import partial
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter
 from pydantic_ai import AbstractToolset, RunContext, ToolDefinition, WrapperToolset
@@ -279,6 +280,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     so Tool Search discoveries don't bust the tool-definitions cache prefix.
     """
 
+    execution_mode: Literal['snapshot', 'async'] = 'snapshot'
+    """VM runner: snapshots for restricted workflow loops, or cancellable async execution."""
+
     # init=False so `replace()` in `for_run` produces a fresh instance with _repl=None,
     # giving each agent run isolated REPL state. Lazy-initialized on first call_tool.
     _repl: MontyRepl | None = field(default=None, init=False, repr=False)
@@ -450,6 +454,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         #   These tools are rendered as `def` (sync) and resolved inline.
         global_sequential = _global_mode_is_sequential(tool_manager.get_parallel_execution_mode)
         sequential_tools = {name for name, td in callable_defs.items() if td.sequential}
+        if self.execution_mode == 'async' and (
+            self.os_access is not None or self.mount is not None or sequential_tools or global_sequential
+        ):
+            raise UserError(
+                'Async code mode requires parallel tools, no OS access or mounts, and a standard asyncio loop.'
+            )
 
         # Collect nested tool calls and returns keyed by tool_call_id so they
         # can be attached as metadata on the run_code ToolReturnPart.
@@ -532,17 +542,28 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         capture = _PrintCapture()
 
         try:
-            monty_state = self._repl.feed_start(code, print_callback=capture, os=self.os_access, mount=self.mount)
-            completed = await _execution_loop(
-                monty_state,
-                dispatch=dispatch_tool_call,
-                callable_defs=callable_defs,
-                sanitized_to_original=sanitized_to_original,
-                sequential_tools=sequential_tools,
-                global_sequential=global_sequential,
-                os_access=self.os_access,
-                mount=self.mount,
-            )
+            if self.execution_mode == 'async':
+                result = await _async_execution(
+                    self._repl,
+                    code,
+                    dispatch=dispatch_tool_call,
+                    callable_defs=callable_defs,
+                    sanitized_to_original=sanitized_to_original,
+                    capture=capture,
+                )
+            else:
+                monty_state = self._repl.feed_start(code, print_callback=capture, os=self.os_access, mount=self.mount)
+                completed = await _execution_loop(
+                    monty_state,
+                    dispatch=dispatch_tool_call,
+                    callable_defs=callable_defs,
+                    sanitized_to_original=sanitized_to_original,
+                    sequential_tools=sequential_tools,
+                    global_sequential=global_sequential,
+                    os_access=self.os_access,
+                    mount=self.mount,
+                )
+                result = completed.output
         except MontySyntaxError as e:
             raise ModelRetry(f'Syntax error in code:\n{_prepend_prints(e.display(), capture)}') from e
         except MontyTypingError as e:  # pragma: no cover -- MontyRepl.feed_start doesn't raise this
@@ -559,7 +580,6 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # semantics are the same -- the model gets another chance.
             raise ModelRetry(f'Runtime error:\n{_prepend_prints(e.display(), capture)}') from e
 
-        result = completed.output
         printed = capture.joined
 
         # Validate result to reconstruct multimodal types (e.g. BinaryContent from
@@ -717,6 +737,61 @@ def _get_sigs_and_conflicting(
         assert td.function_signature is not None, f'function_signature missing for tool {td.name!r}'
         sigs.append(td.function_signature)
     return sigs, FunctionSignature.get_conflicting_type_names(sigs)
+
+
+async def _async_execution(
+    repl: MontyRepl,
+    code: str,
+    *,
+    dispatch: _DispatchFn,
+    callable_defs: dict[str, ToolDefinition],
+    sanitized_to_original: dict[str, str],
+    capture: _PrintCapture,
+) -> object:
+    """Run native async Monty while owning the lifetime of its Python tool tasks."""
+    pending: set[asyncio.Task[object]] = set()
+    closed = False
+
+    async def call(name: str, *args: object, **kwargs: object) -> object:
+        # Monty can schedule a callback just before its native future completes.
+        # Such a callback must not start tool work after this scope has closed.
+        if closed:
+            raise asyncio.CancelledError()
+        if args:
+            raise TypeError(f'{name}() does not accept positional arguments; use keyword arguments')
+        task = asyncio.current_task()
+        assert task is not None
+        pending.add(task)
+        try:
+            return await dispatch(sanitized_to_original.get(name, name), kwargs)
+        finally:
+            pending.discard(task)
+
+    functions = {name: partial(call, name) for name in callable_defs}
+    vm_task = asyncio.ensure_future(repl.feed_run_async(code, external_functions=functions, print_callback=capture))
+    try:
+        # Deliver cancellation to Monty once. Repeated caller cancellation must
+        # not interrupt its REPL-restoration wait.
+        return await asyncio.shield(vm_task)
+    except asyncio.CancelledError:
+        vm_task.cancel()
+        raise
+    finally:
+        closed = True
+        # Native cancellation stops the VM but does not cancel Python callbacks.
+        # Await their cleanup before the caller drains usage or releases resources.
+        tasks = list(pending)
+        for task in tasks:
+            task.cancel()
+        cleanup = asyncio.gather(vm_task, *tasks, return_exceptions=True)
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 async def _execution_loop(

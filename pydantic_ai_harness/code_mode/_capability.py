@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
@@ -89,6 +89,14 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
+    execution_mode: Literal['snapshot', 'async'] = 'snapshot'
+    """Use `async` to run VM computation off the event loop and support cancellation.
+
+    The default snapshot runner supports restricted workflow event loops. Async
+    execution requires a standard asyncio loop, parallel tools, and no OS access
+    or mounts. Nested tool calls are cancelled and awaited when a snippet exits.
+    """
+
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
 
@@ -140,6 +148,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
+            execution_mode=self.execution_mode,
         )
 
     async def after_tool_execute(

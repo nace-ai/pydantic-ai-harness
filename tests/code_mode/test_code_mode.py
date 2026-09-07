@@ -398,7 +398,8 @@ class TestCodeMode:
         tools = await wrapper.get_tools(ctx)
         run_code = tools['run_code']
         # Fresh REPL: type checker catches the syntax error.
-        with pytest.raises(ModelRetry, match=r'Syntax error in code'):
+        # Monty 0.0.18 reports parser diagnostics through MontyTypingError.
+        with pytest.raises(ModelRetry, match=r'(Syntax|Type) error in code'):
             await wrapper.call_tool('run_code', {'code': 'def ('}, ctx, run_code)
 
         # Non-fresh REPL: feed_start catches the syntax error at runtime.

@@ -69,6 +69,20 @@ uv add "pydantic-ai-harness[codemode]"
 
 The `code-mode` extra is also supported as an alias.
 
+## Async execution
+
+For a standalone agent serving concurrent requests, use
+`CodeMode(execution_mode='async')` with Monty 0.0.18 or later. VM computation
+runs off the asyncio event loop. Cancelling a snippet requests native VM
+cancellation and waits for both REPL restoration and nested tool cleanup.
+Cancellation is checked at VM checkpoints; it cannot impose a hard deadline
+on one long native operation. Tools must cooperate with asyncio cancellation.
+
+This mode supports parallel tools without OS access or mounts. Unsupported
+configurations raise `UserError`. It requires a standard asyncio event loop;
+keep the default snapshot mode inside Temporal or other restricted workflow
+loops. The default tool definitions, prompts and snapshot behavior are unchanged.
+
 ## Selective tool sandboxing
 
 By default, `CodeMode(tools='all')` sandboxes every tool. You can control which tools go through the sandbox:
