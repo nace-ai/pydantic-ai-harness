@@ -83,6 +83,23 @@ pip install "pydantic-ai-harness[codemode]"
 
 The `code-mode` extra is also supported as an alias.
 
+## Async execution
+
+For a standalone agent serving concurrent requests, use
+`CodeMode(execution_mode='async')`. The feed runs through `pydantic_monty.AsyncMonty`,
+so worker protocol I/O stays off the asyncio event loop and a compute-heavy snippet
+never stalls other requests in the host process. Cancelling a `run_code` call
+interrupts the VM immediately (the pool discards that worker and the next call starts
+a fresh REPL), then cancels and awaits the nested tool tasks the snippet started before
+the call unwinds — tools must cooperate with asyncio cancellation.
+
+This mode supports parallel tools without OS access or mounts, and composes with
+`max_tool_calls`, `resource_limits` (time awaiting external tools does not count
+toward `max_duration_secs`), and `dynamic_catalog`; it is not compatible with `eager`.
+Unsupported configurations raise `UserError`. It requires a standard asyncio event
+loop; keep the default snapshot mode inside Temporal or other restricted workflow
+loops. The default tool definitions, prompts and snapshot behavior are unchanged.
+
 ## Selective tool sandboxing
 
 By default, `CodeMode(tools='all')` sandboxes every eligible regular tool. Framework control tools,
