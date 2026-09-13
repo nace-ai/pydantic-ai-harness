@@ -8,7 +8,8 @@ import keyword
 import re
 import warnings
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import AsyncExitStack, ExitStack
+from functools import partial
 from dataclasses import dataclass, field, replace
 from itertools import islice
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
@@ -36,9 +37,13 @@ try:
 except ImportError:  # pragma: no cover
     _SEARCH_TOOLS_NAME = 'search_tools'  # pyright: ignore[reportConstantRedefinition]
 
+import anyio
+
 try:
     from pydantic_monty import (
         AbstractOS,
+        AsyncMonty,
+        AsyncMontySession,
         Monty,
         MontyCrashedError,
         MontyRuntimeError,
@@ -292,6 +297,56 @@ class _MontyRunState:
         self.reset()
         self._pool_stack.close()
         self._pool_stack = ExitStack()
+        self.pool = None
+
+
+@dataclass
+class _AsyncMontyRunState:
+    """Async-mode Monty resources shared by every toolset view created during one agent run.
+
+    The `execution_mode='async'` counterpart of `_MontyRunState`: the pool and session are
+    `AsyncMonty` / `AsyncMontySession`, whose worker protocol I/O runs off the event loop,
+    so a compute-heavy snippet never stalls other tasks in the host process and a cancelled
+    feed is interrupted immediately (the pool discards that worker).
+    """
+
+    pool: AsyncMonty | None = None
+    session: AsyncMontySession | None = None
+    has_executed_feed: bool = False
+    _pool_stack: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
+    _session_stack: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
+
+    async def get_session(
+        self, *, type_check: bool, type_check_stubs: str | None, limits: ResourceLimits
+    ) -> AsyncMontySession:
+        """Return the run's live REPL session, creating its pool on first use."""
+        if self.pool is None:
+            self.pool = await self._pool_stack.enter_async_context(AsyncMonty())
+        if self.session is None:
+            self.session = await self._session_stack.enter_async_context(
+                self.pool.checkout(limits=limits, type_check=type_check, type_check_stubs=type_check_stubs)
+            )
+        return self.session
+
+    async def reset(self) -> None:
+        """Return the current worker and make the next call start a fresh REPL.
+
+        Shielded: reset runs on cancellation paths, where an enclosing anyio scope may
+        already be cancelled and would otherwise interrupt the worker teardown, leaking
+        the checkout.
+        """
+        with anyio.CancelScope(shield=True):
+            await self._session_stack.aclose()
+        self._session_stack = AsyncExitStack()
+        self.session = None
+        self.has_executed_feed = False
+
+    async def close(self) -> None:
+        """Return the checked-out worker and close the owning pool."""
+        await self.reset()
+        with anyio.CancelScope(shield=True):
+            await self._pool_stack.aclose()
+        self._pool_stack = AsyncExitStack()
         self.pool = None
 
 
@@ -666,9 +721,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     so Tool Search discoveries don't bust the tool-definitions cache prefix.
     """
 
+    execution_mode: Literal['snapshot', 'async'] = field(default='snapshot', kw_only=True)
+    """VM runner: snapshots for restricted workflow loops, or cancellable off-loop async execution."""
+
     # Shared by `for_run_step` copies so they use the same REPL session and the original entered
     # instance can close it. `for_run` leaves this unset, giving concurrent runs isolated state.
-    _run_state: _MontyRunState | None = field(default=None, init=False, repr=False, compare=False)
+    _run_state: _MontyRunState | _AsyncMontyRunState | None = field(default=None, init=False, repr=False, compare=False)
 
     # Catalog string stashed during `get_tools` (when `dynamic_catalog`) and read back by
     # `get_instructions` in the same step. Empty when there's nothing to surface.
@@ -701,7 +759,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         _resolve_resource_limits(self.resource_limits)
         if self.max_tool_calls < 1:
             raise UserError('`max_tool_calls` must be at least 1')
-        run_state = _MontyRunState()
+        if self.execution_mode == 'async' and (self.os_access is not None or self.mount is not None):
+            raise UserError(
+                'Async code mode requires parallel tools, no OS access or mounts, and a standard asyncio loop.'
+            )
+        run_state = _AsyncMontyRunState() if self.execution_mode == 'async' else _MontyRunState()
         await self.wrapped.__aenter__()
         self._run_state = run_state
         return self
@@ -714,7 +776,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         try:
             return await self.wrapped.__aexit__(*args)
         finally:
-            run_state.close()
+            if isinstance(run_state, _AsyncMontyRunState):
+                await run_state.close()
+            else:
+                run_state.close()
 
     async def get_instructions(
         self, ctx: RunContext[AgentDepsT]
@@ -837,7 +902,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         assert run_state is not None, '`CodeModeToolset` must be entered before calling `run_code`'
 
         if restart:
-            run_state.reset()
+            await _reset_run_state(run_state)
 
         execution = RunCodeExecution(parent_tool_call_id=ctx.tool_call_id or 'pyd_ai_code_mode')
         result = await self._execute_code(code, ctx, run_code_tool, execution)
@@ -884,6 +949,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         #   These tools are rendered as `def` (sync) and resolved inline.
         global_sequential = _global_mode_is_sequential(tool_manager.get_parallel_execution_mode)
         sequential_tools = {name for name, td in callable_defs.items() if td.sequential}
+        if self.execution_mode == 'async' and (sequential_tools or global_sequential):
+            # os_access/mount are rejected at `__aenter__`; the sequential constraints are only
+            # knowable here, once the run's tools and execution-mode context var are in hand.
+            raise UserError(
+                'Async code mode requires parallel tools, no OS access or mounts, and a standard asyncio loop.'
+            )
 
         def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Coroutine[Any, Any, Any]:
             """Reserve nested-call budget, then build the coroutine that runs the call.
@@ -967,43 +1038,57 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         capture = execution.capture
 
         try:
-            session = run_state.get_session(
-                type_check=type_check,
-                type_check_stubs=type_check_stubs,
-                limits=_resolve_resource_limits(self.resource_limits, in_temporal_workflow=_in_temporal_workflow(ctx)),
-            )
+            limits = _resolve_resource_limits(self.resource_limits, in_temporal_workflow=_in_temporal_workflow(ctx))
             try:
-                monty_state = session.feed_start(
-                    code,
-                    print_callback=capture.callback,
-                    os=self.os_access,
-                    mount=self.mount,
-                    skip_type_check=not type_check,
-                )
-                completed = await MontyExecutor(
-                    dispatch=dispatch_tool_call,
-                    valid_names=callable_defs,
-                    sequential_names=sequential_tools,
-                    global_sequential=global_sequential,
-                ).run(monty_state)
+                if isinstance(run_state, _AsyncMontyRunState):
+                    async_session = await run_state.get_session(
+                        type_check=type_check, type_check_stubs=type_check_stubs, limits=limits
+                    )
+                    result_value = await _async_execution(
+                        async_session,
+                        code,
+                        dispatch=dispatch_tool_call,
+                        callable_defs=callable_defs,
+                        skip_type_check=not type_check,
+                        capture=capture,
+                    )
+                else:
+                    session = run_state.get_session(
+                        type_check=type_check, type_check_stubs=type_check_stubs, limits=limits
+                    )
+                    monty_state = session.feed_start(
+                        code,
+                        print_callback=capture.callback,
+                        os=self.os_access,
+                        mount=self.mount,
+                        skip_type_check=not type_check,
+                    )
+                    completed = await MontyExecutor(
+                        dispatch=dispatch_tool_call,
+                        valid_names=callable_defs,
+                        sequential_names=sequential_tools,
+                        global_sequential=global_sequential,
+                    ).run(monty_state)
+                    result_value = completed.output
             except MontyRuntimeError:
                 # The session is idle again and keeps assignments made before the failing line.
                 run_state.has_executed_feed = True
                 raise
             except asyncio.CancelledError:
-                # The feed never finished, so the REPL is mid-statement. Start fresh next time.
-                run_state.reset()
+                # The feed never finished, so the REPL is mid-statement (async mode also
+                # discarded its worker when the turn was cancelled). Start fresh next time.
+                await _reset_run_state(run_state)
                 raise
             run_state.has_executed_feed = True
         except MontySyntaxError as e:
             if fresh_repl:
                 # No code ran, so discard the checkout-time type stubs. A later step may expose
                 # a different tool catalog (for example after Tool Search discovers a tool).
-                run_state.reset()
+                await _reset_run_state(run_state)
             raise ModelRetry(f'Syntax error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyTypingError as e:
             # Typing errors can only come from the fresh-feed check above.
-            run_state.reset()
+            await _reset_run_state(run_state)
             raise ModelRetry(f'Type error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyRuntimeError as e:
             # Exceptions raised inside dispatch_tool_call (e.g. UserError from
@@ -1042,7 +1127,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # request timeout) and the REPL state died with it; the pool replaces the
             # worker transparently. Reset so the retry starts from a fresh,
             # type-checked session.
-            run_state.reset()
+            await _reset_run_state(run_state)
             raise ModelRetry(
                 'The code crashed the sandbox worker and the session was reset. Revise the code and try again.'
             ) from e
@@ -1052,7 +1137,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # the error text: there is no Monty `display()` for host-side failures, and the cause
             # chain is dropped once the retry becomes a prompt part, so this message is the only
             # record of what failed for both the model and the transcript.
-            run_state.reset()
+            await _reset_run_state(run_state)
             error_text = f'{type(e).__name__}: {e}'
             raise ModelRetry(
                 'Code execution failed and the session was reset. Re-run any imports, recreate '
@@ -1062,16 +1147,16 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # Convert a sandbox panic to a retry (see `is_sandbox_panic`);
             # interruptions re-raise unchanged after dropping the suspended session.
             if not is_sandbox_panic(e):
-                run_state.reset()
+                await _reset_run_state(run_state)
                 raise
             # The panic aborts the VM mid-execution, so the REPL's accumulated state cannot
             # be trusted; drop it so the retry starts from a fresh, type-checked session.
-            run_state.reset()
+            await _reset_run_state(run_state)
             raise ModelRetry(
                 'The code aborted inside the sandbox and the session was reset. Revise the code and try again.'
             ) from e
 
-        result = completed.output
+        result = result_value
         # Validate result to reconstruct multimodal types (e.g. BinaryContent from
         # serialized dicts) so they flow through to the model natively.
         if result is not None:
@@ -1180,6 +1265,85 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             for td in callable_defs.values()
         )
         return '\n\n'.join(parts)
+
+
+async def _reset_run_state(run_state: _MontyRunState | _AsyncMontyRunState) -> None:
+    """Reset either run-state flavor; the async flavor returns its worker asynchronously."""
+    if isinstance(run_state, _AsyncMontyRunState):
+        await run_state.reset()
+    else:
+        run_state.reset()
+
+
+async def _async_execution(
+    session: AsyncMontySession,
+    code: str,
+    *,
+    dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]],
+    callable_defs: dict[str, ToolDefinition],
+    skip_type_check: bool,
+    capture: PrintCapture,
+) -> Any:
+    """Run one feed on the async Monty session while owning the lifetime of its tool tasks.
+
+    `AsyncMontySession.feed_run` schedules each external callable as its own asyncio task,
+    but cancelling the feed abandons those tasks (verified against pydantic-monty 0.0.23):
+    they are neither cancelled nor awaited by the pool. The host must not unwind while
+    nested tool work (which may mutate shared usage or metering) is still running, so this
+    wrapper tracks every dispatched task and, whichever way the feed ends, cancels the
+    stragglers and awaits their cleanup before returning or re-raising.
+    """
+    pending: set[asyncio.Task[Any]] = set()
+    closed = False
+
+    async def call(name: str, *args: Any, **kwargs: Any) -> Any:
+        # Monty can invoke a callback just as the feed settles. Such a callback must not
+        # start tool work after this scope has closed.
+        if closed:
+            raise asyncio.CancelledError()
+        if args:
+            raise TypeError(f'{name}() does not accept positional arguments; use keyword arguments')
+        task = asyncio.current_task()
+        assert task is not None
+        pending.add(task)
+        try:
+            # `dispatch` reserves nested-call budget synchronously before building the
+            # coroutine, so a refusal is raised here and delivered at the sandbox call site.
+            return await dispatch(name, kwargs)
+        finally:
+            pending.discard(task)
+
+    functions = {name: partial(call, name) for name in callable_defs}
+    feed = asyncio.ensure_future(
+        session.feed_run(
+            code, external_lookup=functions, print_callback=capture.callback, skip_type_check=skip_type_check
+        )
+    )
+    try:
+        # Deliver caller cancellation to the feed exactly once; the shield keeps a repeated
+        # caller cancel from interrupting the drain below.
+        return await asyncio.shield(feed)
+    except asyncio.CancelledError:
+        feed.cancel()
+        raise
+    finally:
+        closed = True
+        # Cancelling the feed stops the VM but leaves the dispatched Python tasks running.
+        # Await their cleanup before the caller drains usage or releases resources. The
+        # shield-in-a-loop holds against repeated cancellation from an enclosing anyio
+        # scope, which re-cancels its tasks on every event-loop cycle.
+        tasks = list(pending)
+        for task in tasks:
+            task.cancel()
+        cleanup = asyncio.gather(feed, *tasks, return_exceptions=True)
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 def _get_sigs_and_conflicting(

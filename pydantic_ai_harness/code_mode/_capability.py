@@ -10,6 +10,7 @@ from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.capabilities._tool_search import ToolSearch as _ToolSearch
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import AgentStreamEvent, ModelResponse, NativeToolSearchReturnPart, SystemPromptPart
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
@@ -124,6 +125,20 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     See the Code Mode guide for the execution and `restart` semantics.
     """
 
+    execution_mode: Literal['snapshot', 'async'] = 'snapshot'
+    """Use `async` to keep the host event loop responsive while the VM computes, and to
+    support prompt cancellation.
+
+    The default snapshot runner drives the worker through synchronous protocol turns, so a
+    compute-heavy statement blocks the host event loop until it suspends; it supports
+    restricted workflow event loops (Temporal/DBOS). Async execution runs the feed through
+    `pydantic_monty.AsyncMonty`, whose worker I/O stays off the event loop; cancelling the
+    `run_code` call interrupts the VM immediately (discarding the worker) and the nested
+    tool tasks the snippet started are cancelled and awaited before the call unwinds.
+    Requires a standard asyncio loop, parallel tools, and no OS access or mounts; not
+    compatible with `eager`.
+    """
+
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
 
@@ -168,6 +183,8 @@ class CodeMode(AbstractCapability[AgentDepsT]):
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
         """Wrap the agent's assembled toolset, splitting it into native + sandboxed subsets if needed."""
+        if self.execution_mode == 'async' and self.eager:
+            raise UserError('Async code mode is not compatible with eager execution.')
         if self.eager:
             return EagerCodeModeToolset(
                 wrapped=toolset,
@@ -188,6 +205,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
+            execution_mode=self.execution_mode,
         )
 
     @property
