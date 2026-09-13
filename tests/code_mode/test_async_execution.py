@@ -21,7 +21,10 @@ from pydantic_monty import MountDir, OsFunction
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness._monty_exec import PrintCapture
 from pydantic_ai_harness.code_mode import CodeModeToolset
-from pydantic_ai_harness.code_mode._toolset import _async_execution  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
+    _async_execution,
+    _AsyncMontyRunState,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -103,6 +106,7 @@ class TestAsyncExecution:
         result = await _async_execution(
             DeferredCallbackSession(),  # pyright: ignore[reportArgumentType]
             '42',
+            run_state=_AsyncMontyRunState(),
             dispatch=dispatch,
             callable_defs={'value': None},  # pyright: ignore[reportArgumentType] -- only keys are read
             skip_type_check=True,
@@ -188,6 +192,43 @@ class TestAsyncExecution:
         # The cancelled turn discarded its worker; the next call starts a fresh REPL.
         result = await wrapper.call_tool('run_code', {'code': '40 + 2'}, ctx, tool)
         assert result.return_value == 42
+
+    async def test_toolset_exit_interrupts_live_cpu_feed(self) -> None:
+        """Teardown owns a feed the run abandoned mid-compute.
+
+        pydantic-ai closes a run's toolsets before the in-flight tool-call tasks observe
+        cancellation, so `__aexit__` is the first code positioned to stop a CPU-burning
+        VM. It must interrupt the feed at once rather than sit on the busy worker until
+        its `max_duration_secs` backstop aborts the snippet.
+        """
+        started = asyncio.Event()
+
+        async def ready() -> int:
+            started.set()
+            return 1
+
+        wrapper = CodeModeToolset(FunctionToolset(tools=[ready]), execution_mode='async')
+        ctx = await build_ctx(None, wrapper)
+        tool = (await wrapper.get_tools(ctx))['run_code']
+        task = asyncio.create_task(
+            wrapper.call_tool(
+                'run_code',
+                {'code': 'x = await ready()\nwhile True:\n    x += 1'},
+                ctx,
+                tool,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.sleep(0.05)  # the VM is now computing, with no suspension point ahead
+        _entered_toolsets.remove(wrapper)
+        loop = asyncio.get_running_loop()
+        exit_started = loop.time()
+        await wrapper.__aexit__(None, None, None)
+        elapsed = loop.time() - exit_started
+        assert elapsed < 2, f'toolset exit waited {elapsed:.1f}s on a live feed instead of interrupting it'
+        # The abandoned call unwinds as cancelled once its feed is interrupted.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
 
     @pytest.mark.parametrize('finish', ['cancel', 'cancel_twice', 'error', 'return'])
     async def test_nested_calls_are_drained(self, finish: str) -> None:

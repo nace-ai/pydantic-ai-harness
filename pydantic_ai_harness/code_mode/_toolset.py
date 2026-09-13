@@ -9,8 +9,8 @@ import re
 import warnings
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import AsyncExitStack, ExitStack
-from functools import partial
 from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import islice
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
@@ -315,6 +315,20 @@ class _AsyncMontyRunState:
     has_executed_feed: bool = False
     _pool_stack: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
     _session_stack: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
+    # Live feeds by their drain event. pydantic-ai closes a run's toolsets before the
+    # in-flight tool-call tasks observe cancellation, so `reset` may be the first (and
+    # only) code positioned to stop a feed still computing in the VM.
+    _active_feeds: dict[asyncio.Future[Any], asyncio.Event] = field(
+        default_factory=dict[asyncio.Future[Any], asyncio.Event], repr=False
+    )
+
+    def track_feed(self, feed: asyncio.Future[Any]) -> None:
+        """Register a live feed so `reset` can interrupt it and await its drain."""
+        self._active_feeds[feed] = asyncio.Event()
+
+    def feed_done(self, feed: asyncio.Future[Any]) -> None:
+        """Mark a feed's execution wrapper fully drained: its nested tool tasks are done."""
+        self._active_feeds.pop(feed).set()
 
     async def get_session(
         self, *, type_check: bool, type_check_stubs: str | None, limits: ResourceLimits
@@ -331,11 +345,21 @@ class _AsyncMontyRunState:
     async def reset(self) -> None:
         """Return the current worker and make the next call start a fresh REPL.
 
+        Owns any still-live feed first: cancelling it interrupts the VM immediately (the
+        pool discards that worker), and waiting for the execution wrapper's drain event
+        preserves the ordering contract that nested tool tasks finish their cleanup
+        (usage, metering) before resources are released. Without this, a `reset` racing
+        an abandoned CPU-bound feed blocks in the `aclose` below until the worker's
+        `max_duration_secs` backstop aborts the snippet.
+
         Shielded: reset runs on cancellation paths, where an enclosing anyio scope may
         already be cancelled and would otherwise interrupt the worker teardown, leaking
         the checkout.
         """
         with anyio.CancelScope(shield=True):
+            for feed, drained in list(self._active_feeds.items()):
+                feed.cancel()
+                await drained.wait()
             await self._session_stack.aclose()
         self._session_stack = AsyncExitStack()
         self.session = None
@@ -1047,6 +1071,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                     result_value = await _async_execution(
                         async_session,
                         code,
+                        run_state=run_state,
                         dispatch=dispatch_tool_call,
                         callable_defs=callable_defs,
                         skip_type_check=not type_check,
@@ -1279,6 +1304,7 @@ async def _async_execution(
     session: AsyncMontySession,
     code: str,
     *,
+    run_state: _AsyncMontyRunState,
     dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]],
     callable_defs: dict[str, ToolDefinition],
     skip_type_check: bool,
@@ -1292,6 +1318,10 @@ async def _async_execution(
     nested tool work (which may mutate shared usage or metering) is still running, so this
     wrapper tracks every dispatched task and, whichever way the feed ends, cancels the
     stragglers and awaits their cleanup before returning or re-raising.
+
+    The feed is also registered on `run_state`: when the agent run is cancelled,
+    pydantic-ai tears the toolsets down before this task observes any cancellation, so
+    `reset` must be able to interrupt the feed itself and await this wrapper's drain.
     """
     pending: set[asyncio.Task[Any]] = set()
     closed = False
@@ -1319,6 +1349,7 @@ async def _async_execution(
             code, external_lookup=functions, print_callback=capture.callback, skip_type_check=skip_type_check
         )
     )
+    run_state.track_feed(feed)
     try:
         # Deliver caller cancellation to the feed exactly once; the shield keeps a repeated
         # caller cancel from interrupting the drain below.
@@ -1342,6 +1373,7 @@ async def _async_execution(
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
                 cancelled = True
+        run_state.feed_done(feed)
         if cancelled:
             raise asyncio.CancelledError()
 
